@@ -1,0 +1,11 @@
+[logger]
+config = log4perl.conf
+
+[module-factory]
+path = ./processors:./workers
+
+[module worker-db]
+dsn = DBI:mysql:database=pm;host=localhost
+username = pm
+password = pm
+install_or_upgrade = 1

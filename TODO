@@ -1,0 +1,37 @@
+- ProcessManager::Helper; Change unregister to be detached from the object.
+
+ProcessManager::Cache; A Client that caches information from
+   ProcessManager every now and then. Instanced.
+
+StatisticManager; New Server/Client for storing statistics.
+
+ModuleFactory; Make calls to module run within eval and push error if
+   failed.
+
+ALL; remove close().
+
+WorkDispatcher, Worker; add work_wait, result etc.
+
+WorkerSNMP; In Walk and BulkWalk, only use the rest of the oid and
+   hash key, remove the base.
+
+RPC; remove unwraping of arrays on all call/called, pass arrays
+   insteed, 3 fold performance.
+
+Payload & Workers: Add version on payload, check version in workers
+   and send a retransmitt work error. This to allow change in payload
+   for modules.
+
+APIBridges: Add authentication and some tools to manage password
+   files.
+
+Rolling Restart: Add capability to do rolling restarts.
+
+CLI/API: Change add_order to take options, if callback create a
+   callback and wait for all results. Change add_order_callback to
+   take a custom callback.
+
+OrderProcessor: On process_end if no OrderManager can be reached mark
+   the order ended and setup a timer to reconnect to the OrderManager
+   and end the order. Also add support to the OrderManager to not
+   resync ended orders on discovering OrderProcessors.

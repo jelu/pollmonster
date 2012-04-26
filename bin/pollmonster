@@ -1,0 +1,398 @@
+#!/usr/bin/perl
+# PollMonster - a distributed data collection framework
+# Copyright (C) 2010 Jerry Lundström
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# PollMonster is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with PollMonster.  If not, see <http://www.gnu.org/licenses/>.
+
+use common::sense;
+
+use PollMonster qw(:name);
+use PollMonster::ProcessManager::Server;
+use PollMonster::ProcessManager::Client;
+use PollMonster::OrderManager::Server;
+use PollMonster::OrderProcessor::Server;
+use PollMonster::WorkDispatcher::Server;
+use PollMonster::Worker::Server;
+use PollMonster::TimeSlotManager::Server;
+use PollMonster::CLI;
+use PollMonster::ModuleFactory;
+use PollMonster::ProcessManager::Helper;
+use PollMonster::APIBridge::JSONP;
+use PollMonster::APIBridge::JSON;
+
+use Getopt::Long ();
+use Pod::Usage ();
+use Config::IniFiles ();
+use Log::Log4perl ();
+use POSIX qw(getpid);
+
+use EV ();
+use AnyEvent ();
+use Coro ();
+use Coro::EV ();
+use Coro::AnyEvent ();
+
+AnyEvent::detect;
+
+=head1 NAME
+
+pollmonster
+
+=head1 VERSION
+
+See L<PollMonster> for version.
+
+=cut
+
+my ($config, @objects, $log4perl, $pidfile, @signals, $logger);
+
+$config = Config::IniFiles->new;
+
+Getopt::Long::GetOptions(
+    'config=s' => sub { $config->SetFileName($_[1]); },
+    'log4perl=s' => \$log4perl,
+    'pidfile=s' => \$pidfile,
+    help => sub { Pod::Usage::pod2usage(1); }
+    ) or Pod::Usage::pod2usage(2);
+
+if (defined $pidfile) {
+    if (open(PIDFILE, '>'.$pidfile)) {
+        print PIDFILE getpid;
+        close(PIDFILE);
+    }
+    else {
+        die 'Unable to save pidfile '.$pidfile.': '.$!;
+    }
+}
+
+unless ($config->GetFileName) {
+    Pod::Usage::pod2usage(2);
+}
+
+unless ($config->ReadConfig) {
+    die 'Unable to read config file';
+}
+
+foreach my $section ($config->Sections) {
+    foreach my $parameter ($config->Parameters($section)) {
+        PollMonster->SET_CFG($section, $parameter, $config->val($section, $parameter));
+    }
+}
+
+if (defined $log4perl and -f $log4perl) {
+    Log::Log4perl->init($log4perl);
+}
+elsif (defined PollMonster->CFG(LOGGER_NAME, 'config')) {
+    Log::Log4perl->init(PollMonster->CFG(LOGGER_NAME, 'config'));
+}
+else {
+    Log::Log4perl->init( \q(
+log4perl.logger                        = WARN, PollMonster
+log4perl.appender.PollMonster          = Log::Log4perl::Appender::Screen
+log4perl.appender.PollMonster.stderr   = 0
+log4perl.appender.PollMonster.layout   = Log::Log4perl::Layout::PatternLayout
+log4perl.appender.PollMonster.layout.ConversionPattern = %d [%R] %F [%L] %p: %m%n
+) );
+}
+
+$SIG{__WARN__} = sub {
+    Log::Log4perl->get_logger->logcarp(@_);
+};
+
+$SIG{__DIE__} = sub {
+    Log::Log4perl->get_logger->logconfess(@_);
+};
+
+$logger = Log::Log4perl->get_logger;
+
+push(@signals,
+     AnyEvent->signal( signal => 'HUP', cb => sub {
+         $logger->info('Got HUP, reloading config ', $config->GetFileName);
+
+         if ($config->ReadConfig) {
+             $PollMonster::CONFIG = {};
+
+             foreach my $section ($config->Sections) {
+                 foreach my $parameter ($config->Parameters($section)) {
+                     PollMonster->SET_CFG($section, $parameter, $config->val($section, $parameter));
+                 }
+             }
+
+             $logger->info('Reloading Log::Log4perl config');
+
+             eval {
+                 local $SIG{__DIE__};
+                 local $SIG{__WARN__} = sub { die @_ };
+
+                 if (defined $log4perl and -f $log4perl) {
+                     Log::Log4perl->init($log4perl);
+                 }
+                 elsif (defined PollMonster->CFG(LOGGER_NAME, 'config')) {
+                     Log::Log4perl->init(PollMonster->CFG(LOGGER_NAME, 'config'));
+                 }
+                 else {
+                     Log::Log4perl->init( \q(
+                                              log4perl.logger                        = WARN, PollMonster
+                                              log4perl.appender.PollMonster          = Log::Log4perl::Appender::Screen
+                                              log4perl.appender.PollMonster.stderr   = 0
+                                              log4perl.appender.PollMonster.layout   = Log::Log4perl::Layout::PatternLayout
+                                              log4perl.appender.PollMonster.layout.ConversionPattern = %d [%R] %F [%L] %p: %m%n
+                                          ) );
+                 }
+             };
+
+             if ($@) {
+                 Log::Log4perl->_init(undef, $Log::Log4perl::OLD_CONFIG);
+                 $logger->warn('Error reloading Log::Log4perl config: ', $@);
+             }
+         }
+         else {
+             $logger->warn('Errors reloading config:');
+             foreach my $errstr (@Config::IniFiles::errors) {
+                 $logger->warn($errstr);
+             }
+         }
+     } ),
+    );
+
+foreach (@ARGV) {
+    if (/^(?:mf|module-factory|modulefactory)$/o) {
+        my $mf = PollMonster::ModuleFactory->instance;
+
+        foreach (split(/:/o, PollMonster->CFG(MODULE_FACTORY_NAME, 'path'))) {
+            $mf->load($_);
+        }
+    }
+}
+
+foreach (@ARGV) {
+    if (/^(?:pm|process-manager|processmanager)$/o) {
+        my $srv = PollMonster::ProcessManager::Server->new(
+            uri => PollMonster->CFG(PROCESS_MANAGER_NAME, 'uri')
+            );
+
+        if (defined PollMonster->CFG(GLOBAL_NAME, PROCESS_MANAGER_NAME)) {
+            my $signal = Coro::Signal->new;
+            $srv->register(PollMonster->CFG(GLOBAL_NAME, PROCESS_MANAGER_NAME),
+                          sub { $signal->send });
+            $signal->wait;
+
+            push(@objects, $srv);
+        }
+        else {
+            push(@objects, $srv);
+        }
+    }
+}
+
+foreach (@ARGV) {
+    my $srv = undef;
+
+    if (/^(?:om|order-manager|ordermanager)$/o) {
+        $srv = PollMonster::OrderManager::Server->new(
+            uri => PollMonster->CFG(ORDER_MANAGER_NAME, 'uri')
+            );
+    }
+    elsif (/^(?:op|order-processor|orderprocessor)$/o) {
+        $srv = PollMonster::OrderProcessor::Server->new(
+            uri => PollMonster->CFG(ORDER_PROCESSOR_NAME, 'uri')
+            );
+    }
+    elsif (/^(?:wd|work-dispatcher|workdispatcher)$/o) {
+        $srv = PollMonster::WorkDispatcher::Server->new(
+            uri => PollMonster->CFG(WORK_DISPATCHER_NAME, 'uri')
+            );
+    }
+    elsif (/^(?:w|worker)$/o) {
+        $srv = PollMonster::Worker::Server->new(
+            uri => PollMonster->CFG(WORKER_NAME, 'uri')
+            );
+    }
+    elsif (/^(?:tsm|timeslot-manager|timeslotmanager)$/o) {
+        $srv = PollMonster::TimeSlotManager::Server->new(
+            uri => PollMonster->CFG(TIMESLOT_MANAGER_NAME, 'uri')
+            );
+    }
+    elsif (/^(?:abjp|apibridge-jsonp|apibridgejsonp)$/o) {
+        $srv = PollMonster::APIBridge::JSONP->new(
+            uri => PollMonster->CFG(APIBRIDGE_JSONP_NAME, 'uri'),
+            jsonp_uri => PollMonster->CFG(APIBRIDGE_JSONP_NAME, 'jsonp_uri')
+            );
+    }
+    elsif (/^(?:abj|apibridge-json|apibridgejson)$/o) {
+        $srv = PollMonster::APIBridge::JSON->new(
+            uri => PollMonster->CFG(APIBRIDGE_JSON_NAME, 'uri'),
+            json_uri => PollMonster->CFG(APIBRIDGE_JSON_NAME, 'json_uri')
+            );
+    }
+    elsif (/^cli$/o) {
+        push(@objects, PollMonster::CLI->new());
+    }
+    elsif (/^coro-debug$/o) {
+        push(@objects, AnyEvent->timer(
+                 after => 10,
+                 interval => 10,
+                 cb => sub {
+                     use Coro::Debug ();
+                     Coro::Debug::command 'ps';
+                 })
+            );
+    }
+    elsif (/^tick$/o) {
+        push(@objects, AnyEvent->timer(
+                 after => 2,
+                 interval => 2,
+                 cb => sub {
+                     Log::Log4perl->get_logger->info('tick');
+                 })
+            );
+    }
+
+    if (defined $srv) {
+        if (defined PollMonster->CFG(GLOBAL_NAME, PROCESS_MANAGER_NAME)) {
+            my $signal = Coro::Signal->new;
+            $srv->register(PollMonster->CFG(GLOBAL_NAME, PROCESS_MANAGER_NAME),
+                           sub { $signal->send });
+            $signal->wait;
+        }
+
+        if ($srv->is_registered) {
+            push(@objects, $srv);
+        }
+
+        next;
+    }
+}
+
+if (@objects) {
+    my $cv = AnyEvent->condvar;
+
+    Coro::async {
+        EV::loop;
+        $cv->send;
+    };
+
+    my $cv_sig = AnyEvent->condvar;
+
+    push(@signals,
+         AnyEvent->signal( signal => 'INT', cb => sub { $cv_sig->send } ),
+         AnyEvent->signal( signal => 'QUIT', cb => sub { $cv_sig->send } ),
+         AnyEvent->signal( signal => 'PIPE', cb => sub { $cv_sig->send } ),
+         AnyEvent->signal( signal => 'TERM', cb => sub { $cv_sig->send } )
+        );
+
+    $cv_sig->recv;
+
+    @signals = ();
+    @objects = ();
+
+    my $w; $w = AnyEvent->timer(
+        after => 0.05, interval => 0.05,
+        cb => sub {
+            unless ($PollMonster::ProcessManager::Helper::UNREGISTRATING) {
+                my $end; $end = AnyEvent->timer(
+                    after => 0.1,
+                    cb => sub {
+                        EV::unloop EV::UNLOOP_ALL;
+                        $end = undef;
+                    });
+                $w = undef;
+            }
+        });
+
+    $cv->recv;
+}
+
+@signals = ();
+if (defined $pidfile) {
+    unlink($pidfile);
+}
+exit 0;
+
+=head1 SYNOPSIS
+
+pollmonster [options]
+
+Options:
+
+    --config=file       Specify config file (required)
+    --log4perl=file     Specify Log::Log4perl config file (default; taken from config file)
+    --help              Show this message
+
+=head1 AUTHOR
+
+Jerry Lundström, C<< <lundstrom.jerry at gmail.com> >>
+
+=head1 BUGS
+
+Please report any bugs or feature requests to C<bug-pollmonster at rt.cpan.org>, or through
+the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=PollMonster>.  I will be notified, and then you'll
+automatically be notified of progress on your bug as I make changes.
+
+
+
+
+=head1 SUPPORT
+
+You can find documentation for this module with the perldoc command.
+
+    perldoc PollMonster
+
+
+You can also look for information at:
+
+=over 4
+
+=item * RT: CPAN's request tracker
+
+L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=PollMonster>
+
+=item * AnnoCPAN: Annotated CPAN documentation
+
+L<http://annocpan.org/dist/PollMonster>
+
+=item * CPAN Ratings
+
+L<http://cpanratings.perl.org/d/PollMonster>
+
+=item * Search CPAN
+
+L<http://search.cpan.org/dist/PollMonster/>
+
+=back
+
+
+=head1 ACKNOWLEDGEMENTS
+
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright 2010 Jerry Lundström.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+PollMonster is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with PollMonster.  If not, see <http://www.gnu.org/licenses/>.
+
+
+=cut
+
